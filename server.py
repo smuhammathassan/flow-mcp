@@ -168,6 +168,33 @@ class Flow:
         })""")
 
 
+async def _viewer_strip(p, open_first: bool = False, click: int | None = None) -> list[str]:
+    """Titles of the media viewer's thumbnail strip (buttons between "Previous media" and "Next media").
+    Opens the viewer from the grid when it isn't showing; optionally clicks the strip item at index `click`."""
+    if "/edit/" not in p.url:  # the viewer's URL is /project/<id>/edit/<media id>
+        if not open_first and click is None:
+            return []
+        # The tile's own element is covered by its thumbnail, so click the tile's centre point.
+        box = await p.locator("flow-grid-tile-container").first.bounding_box()
+        await p.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        await p.wait_for_timeout(5000)
+    return await p.evaluate("""k => {
+        const all = [...document.querySelectorAll('button')];
+        const a = all.findIndex(b => b.getAttribute('aria-label') === 'Previous media');
+        const z = all.findIndex(b => b.getAttribute('aria-label') === 'Next media');
+        const strip = a >= 0 && z > a ? all.slice(a + 1, z) : [];
+        if (k !== null && strip[k]) strip[k].click();
+        return strip.map(b => b.getAttribute('aria-label') || '');
+    }""", click)
+
+
+async def _close_menu(p):
+    """Close the download menu if it is still open; a stray Escape would close the media viewer instead."""
+    if await p.locator(".cdk-overlay-container [role=menu]").count():
+        await p.keyboard.press("Escape")
+    await p.wait_for_timeout(600)
+
+
 def _project_path(project_id: str) -> str:
     m = re.search(r"project/([0-9a-f-]{36})", project_id)
     return f"/project/{m.group(1) if m else project_id}"
@@ -338,23 +365,15 @@ async def flow_download(project_id: str, out_dir: str, overwrite: bool = False) 
             tiles = [t for t in await f.tiles() if t["state"] == "done"]
             if not tiles:
                 return {"ok": True, "downloaded": [], "note": "No finished media in this project."}
-            await p.locator("flow-grid-tile-container").first.click()
-            await p.wait_for_timeout(5000)
-            # Thumbnail strip in the viewer: buttons between "Previous media" and "Next media".
-            strip = await p.evaluate("""() => {
-                const all = [...document.querySelectorAll('button')];
-                const a = all.findIndex(b => b.getAttribute('aria-label') === 'Previous media');
-                const z = all.findIndex(b => b.getAttribute('aria-label') === 'Next media');
-                return a >= 0 && z > a ? all.slice(a + 1, z).map((b, k) => ({idx: a + 1 + k, title: b.getAttribute('aria-label') || ''})) : [];
-            }""")
-            for n, item in enumerate(strip, 1):
-                await p.locator("button").nth(item["idx"]).click()
+            titles = await _viewer_strip(p, open_first=True)
+            for n, title in enumerate(titles, 1):
+                await _viewer_strip(p, click=n - 1)
                 await p.wait_for_timeout(3500)
                 m = CLIP_MARKER.search(await p.inner_text("body"))
-                name = f"clip{m.group(1)}.mp4" if m else f"{n:02d}-{_slug(item['title'])}.mp4"
+                name = f"clip{m.group(1)}.mp4" if m else f"{n:02d}-{_slug(title)}.mp4"
                 dest = out / name
                 if dest.exists() and not overwrite:
-                    results.append({"title": item["title"], "file": str(dest), "skipped": "exists"})
+                    results.append({"title": title, "file": str(dest), "skipped": "exists"})
                     continue
                 await p.get_by_role("button", name="Download media").click()
                 await p.wait_for_timeout(1500)
@@ -362,15 +381,14 @@ async def flow_download(project_id: str, out_dir: str, overwrite: bool = False) 
                 texts = [re.sub(r"\s+", " ", await opts.nth(k).inner_text()) for k in range(await opts.count())]
                 choice = next((k for k, t in enumerate(texts) if "720" in t or "Original" in t), None)
                 if choice is None:
-                    results.append({"title": item["title"], "error": f"No original-size option; menu offered {texts}. Nothing clicked."})
-                    await p.keyboard.press("Escape")
+                    results.append({"title": title, "error": f"No original-size option; menu offered {texts}. Nothing clicked."})
+                    await _close_menu(p)
                     continue
                 async with p.expect_download(timeout=120000) as dl:
                     await opts.nth(choice).click()
                 await (await dl.value).save_as(dest)
-                results.append({"title": item["title"], "file": str(dest), "bytes": dest.stat().st_size})
-                await p.keyboard.press("Escape")
-                await p.wait_for_timeout(600)
+                results.append({"title": title, "file": str(dest), "bytes": dest.stat().st_size})
+                await _close_menu(p)
             return {"ok": True, "downloaded": results}
     except Exception as e:
         return {**_err(e), "downloaded": results}
