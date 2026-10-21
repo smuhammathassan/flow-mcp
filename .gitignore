@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+# never commit session cookies
+cookies*.json
+state*.json
+*.mp4
